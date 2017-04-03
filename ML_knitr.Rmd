@@ -1,0 +1,261 @@
+---
+title: "Machine Learning Project"
+author: "Johanna Baker"
+date: "March 31, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+##Introduction
+
+Electronic devices are becoming increasingly common for improving health. They are frequently used to measure how often the user performs specific exercises. This project looks instead at whether data from these devices can be used to identify how well people perform these exercises. Specifically, given a data set of measurements from accelerometers on the belt, forearm, arm, and dumbell, is it possible to classify whether an exercise was performed correctly, and if not, which type of error was made (our of 4 choices)? 
+
+This report addresses the following questions:
+
+1. What model was used and why?  
+2. How was cross validation used?  
+3. What is the expected out of sample error rate?  
+
+##Model
+
+``` {r load_libs, cache=FALSE}
+library(caret)
+library(dplyr)
+library(gbm)
+library(randomForest)
+```
+
+
+The data come from http://groupware.les.inf.puc-rio.br/har. They were collected from six participants and include measurements from four accelerometers (belt, foreamr, arm, and dumbell) at multiple timepoints through each exercise. The dataset also contains summary columns which summarize the data for windows of multiple timepoints. The goal of the analysis was to classify how the exercise was performed. Because the test cases would not be using summary data, the summary columns were not used in the analysis.
+
+
+``` {r load_data, cache=TRUE}
+
+dat <- read.csv("pml-training.csv", na.strings = c("#DIV/0!", "NA",""))
+test <- read.csv("pml-testing.csv", na.strings = c("#DIV/0!", "NA",""))
+
+```
+``` {r omit_summary}
+summary_flds <- grep("^(avg|std|var|kurt|skew|max|min|amp)", names(dat))
+```
+
+
+Ideally, to answer the question of how accurately one can classify whether a new user did the exercise correctly, the data set would not include any user information (such as a specific name or unique timeframe). However, given that this also requires significantly transforming the test data (and I wasn't sure if this was acceptable), I opted to complete the assignment with the user and time data given in the columns: user_name, raw_timestamp_part_1, and raw_timestamp_part_2. X, cvtd_timestamp, new_window, and num_window were omitted.
+
+
+``` {r omit_partial_user}
+dat_nonsummary <- select(dat,-summary_flds, -X, -cvtd_timestamp, -new_window, -num_window)
+
+```
+
+
+The training and validation sets were created using these 56 variables.
+
+``` {r train_val}
+
+set.seed(1)
+inTrain = createDataPartition(dat_nonsummary$classe, p = 3/4)[[1]]
+training = dat_nonsummary[ inTrain,]
+val = dat_nonsummary[-inTrain,]
+
+```
+
+
+##Prediction
+
+Three approaches were compared:
+
+1. Decision trees (rpart)  
+2. Stochastic gradient boosting (gbm)  
+3. Random forests (randomForest)  
+
+
+Cross-validation is used to estimate the accuracy (or, conversely, the out of sample error rate) of a prediction model by testing it on data not used in creating the model. With rpart and gbm, k-fold cross validation was used. Although the random forest function doesn't technically do cross validation, it uses bootstrap samples of 2/3 of the cases to create each tree to produce a relatively unbiased estimate of the error in a test set.  A separate validation set was used to compare the out of sample error for each method. 
+
+
+###1. Decision trees
+
+This yields very low accuracy.
+
+``` {r prediction_rpart, cache=TRUE}
+set.seed(333)
+ctrl <- trainControl(method="cv", number = 10)
+mod_tree <- train(classe~., data=training, trControl=ctrl, method="rpart")
+errorTraining <- 1- mod_tree$results[1,2]
+errorVal <- 1 - confusionMatrix(predict(mod_tree, val), val$classe)$overall[[1]]
+```
+
+The out of sample error rate, using 10-fold cross validation is `r errorTraining`.  
+The error rate in the validation set is `r errorVal`.  
+
+
+###2. Stochastic gradient boosting
+
+Gradient Boosting, once tuned, is much more successful:  
+
+Because the train function in caret was very slow to run both gbm and random random forest models, they were run directly with the gbm and randomForest functions.  
+
+Using the default values, the out of sample error is similar to that for decision trees:  
+(default values: interaction.depth=1, cv.folds=0, n.trees=100, n.minobsinnode=10, shrinkage=.001)
+
+``` {r prediction_gbm_untuned, cache=TRUE}
+set.seed(333)
+mod_gbm_untuned <- gbm(classe~., data=training)
+
+#Note, prediction with gbm produces a probability matrix for each possible classe;
+   # this picks the column with the highest probability to use as the predicted value
+pred_cv <- as.data.frame(predict.gbm(mod_gbm_untuned, val, n.trees=100, type="response"))
+names(pred_cv) <- c("A", "B", "C", "D", "E")
+pred_cv <- colnames(pred_cv)[apply(pred_cv,1,which.max)]
+# confusionMatrix(pred_cv, val$classe)$table
+errorVal <- 1 - confusionMatrix(pred_cv, val$classe)$overall[[1]]
+```
+
+Cross validation is not used by default.  
+The out of sample error (using the validation set) is `r errorVal`  
+
+
+However, gbm has several parameters that can be adjusted:   
+ - cv.folds = number of k-folds for cross validation  
+ - n.trees = number of trees  
+ - interaction.depth = maximum depth of variable interactions  
+ - shrinkage = learning rate  
+ - n.minobsinnode = minimum number of observations in the trees terminal nodes  
+
+After experimenting a little with these, the best model used:  
+cv.folds = 10, n.trees = 150, interaction.depth = 4  
+shrinkage = .2, n.minobsinnode = 20  
+
+```{r prediction_gbm_tuned, cache=TRUE, fig.show="hide"}
+
+set.seed(333)
+mod_gbm_tuned <- gbm(classe~., data=training, cv.folds = 10, n.trees=150, interaction.depth = 4,
+                 shrinkage = .2, n.minobsinnode = 20, distribution = "multinomial")
+#iteration with the smallest error using cross validation
+best.iter <- gbm.perf(mod_gbm_tuned,method="cv")
+```
+
+The iteration with the smallest cross-validation error is: `r best.iter`  
+  
+``` {r prediction_gbm_error, fig.show="hide"}
+
+#this prediction results in a matrix of the probability of each classification for each row;
+   # the class with the highest probability is selected
+pred_cv <- as.data.frame(predict.gbm(mod_gbm_tuned, val, 
+                                     best.iter, type="response"))
+names(pred_cv) <- c("A", "B", "C", "D", "E")
+pred_cv <- colnames(pred_cv)[apply(pred_cv,1,which.max)]
+confusionMatrix(pred_cv, val$classe)
+errorVal <- 1 - confusionMatrix(pred_cv, val$classe)$overall[[1]]
+
+```
+
+The out of sample error (using the validation set) is `r errorVal`.  
+  
+
+
+###3. Random Forests
+
+Random forests perform similarly to the best gbm model.
+
+
+``` {r prediction_rf, cache=TRUE}
+set.seed(333)
+mod_rf_A <- randomForest(classe~., data=training, ytest=val$classe, xtest=val[,1:55],
+                         keep.forest=TRUE)
+
+pred_rf_A_cv <- predict(mod_rf_A, val)
+confusionMatrix(pred_rf_A_cv, val$classe)
+
+errorVal <- 1 - sum(pred_rf_A_cv == val$classe)/length(val$classe)
+```
+
+The out of sample error (using the validation set) is `r errorVal`.
+
+##Test data
+
+Because random forests and gradient boosting performed very similarly, I used both for the test data.
+
+``` {r test}
+testing <- select(test,-summary_flds, -X, -cvtd_timestamp, -new_window, -num_window)
+
+#random forests
+pred_rf_test <- predict(mod_rf_A, testing)
+
+#gbm
+pred_gbm_test <- as.data.frame(predict(mod_gbm_tuned, testing, best.iter, type="response"))
+names(pred_gbm_test) <- c("A", "B", "C", "D", "E")
+pred_gbm_test <- colnames(pred_gbm_test)[apply(pred_gbm_test,1,which.max)]
+
+
+#both
+pred_rf_test
+as.factor(pred_gbm_test)
+
+
+```
+
+
+Both were able to classify all the test cases correctly.
+
+
+
+
+
+``` {r without_user, include=FALSE, eval=FALSE}
+library(scales)
+library(ggplot2)
+
+#plot of identification by user and time
+ggplot(data=dat_nonsummary, aes(y=raw_timestamp_part_1, x=classe, facet=user_name)) +
+  geom_boxplot() + facet_grid(user_name~., scales="free")
+
+#convert full timestamp to percent complete for each classe for each user 
+options(scipen = 999)
+dat_nonsummary$full_timestamp <- as.numeric(paste0(as.character(dat_nonsummary$raw_timestamp_part_1),
+                         sprintf("%06d", dat_nonsummary$raw_timestamp_part_2)))
+
+#get start and stop times for each class for each user
+ex_start <- dat_nonsummary %>%
+  group_by(user_name, classe) %>%
+  summarize(min=min(full_timestamp), max=max(full_timestamp))
+
+#create the variable perc_comp = percent of the exercise completed
+dat_nonsummary <- dat_nonsummary %>%
+  group_by(user_name, classe) %>%
+  left_join(ex_start, by=c("user_name"="user_name", "classe"="classe")) %>%
+  mutate(perc_comp=(full_timestamp-min)/(max-min))
+
+#re-create training and validation sets
+set.seed(1)
+inTrain = createDataPartition(dat_nonsummary$classe, p = 3/4)[[1]]
+training_nouser = dat_nonsummary[ inTrain,c(4:56,60)]
+val_nouser = dat_nonsummary[-inTrain,c(4:56,60)]
+
+
+### CONVERT TIMES FOR TESTING SET ###
+test$full_timestamp <- as.numeric(paste0(as.character(test$raw_timestamp_part_1),
+                                                   sprintf("%06d", test$raw_timestamp_part_2)))
+
+test_nonsummary <- select(test, -summary_flds, -new_window, -X, -cvtd_timestamp)
+test_nonsummary$c <- sapply(test_nonsummary$problem_id, function(x) {
+  ts = test_nonsummary$full_timestamp[test_nonsummary$problem_id==x] 
+  mn = ex_start$min[ex_start$user_name==test_nonsummary$user_name[test_nonsummary$problem_id==x]]
+  mn = ts-mn
+  which.min(mn[mn>=0])
+})
+
+test_nonsummary$c <- as.factor(test_nonsummary$c)
+levels(test_nonsummary$c) <- c("A", "B", "C", "D", "E")
+
+testing <- test_nonsummary %>%
+  group_by(user_name, pred_rf_C_test) %>%
+  left_join(ex_start, by=c("user_name"="user_name", "c"="classe")) %>%
+  mutate(perc_comp=(full_timestamp-min)/(max-min))
+
+
+```
+
